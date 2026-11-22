@@ -13,6 +13,11 @@ from typing import Any
 from flask import current_app
 
 CACHE_TTL_S = 120
+# The repo list behind "blank Repos" changes rarely; cache it longer than the runs
+# so a refresh costs ``max_repos`` calls, not ``max_repos`` + listing pages.
+DISCOVERY_TTL_S = 900
+MAX_REPOS_DEFAULT = 10
+MAX_REPOS_CAP = 30
 REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 HISTORY_PER_WORKFLOW = 8
 
@@ -20,6 +25,40 @@ HISTORY_PER_WORKFLOW = 8
 def _core() -> Any:
     plugin = current_app.config["PLUGIN_REGISTRY"].get("github_core")
     return plugin.server_module if plugin is not None else None
+
+
+def _discover_repos(
+    core: Any,
+    account: dict[str, Any] | None,
+    account_id: str | None,
+    data_dir: Path,
+    acct_key: str,
+) -> list[str]:
+    """Repos the account can see, most recently pushed first (cached ``DISCOVERY_TTL_S``)."""
+    cache = data_dir / f"repos_{re.sub(r'[^A-Za-z0-9_.-]', '_', acct_key)}.json"
+    if cache.exists() and time.time() - cache.stat().st_mtime < DISCOVERY_TTL_S:
+        try:
+            cached = json.loads(cache.read_text(encoding="utf-8"))
+            if isinstance(cached, list):
+                return [str(r) for r in cached if REPO_RE.match(str(r))]
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    if not hasattr(core, "list_accessible_repos"):
+        return []
+    user = ""
+    if account is None:
+        # Public access: fall back to a legacy/default username, if any.
+        with contextlib.suppress(Exception):
+            user = str(core.get_username(account_id) or "").strip().lstrip("@")
+        if not user:
+            return []
+    found = [
+        r for r in core.list_accessible_repos(account_id=account_id, user=user) if REPO_RE.match(r)
+    ]
+    with contextlib.suppress(OSError):
+        cache.write_text(json.dumps(found), encoding="utf-8")
+    return found
 
 
 def choices(name: str, options: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -49,7 +88,9 @@ def fetch(
     del settings
     raw = options.get("repos") or ""
     repos = [r.strip() for r in raw.replace(",", "\n").splitlines() if REPO_RE.match(r.strip())]
-    if not repos:
+    # Blank Repos -> scan the account's most recently pushed repos (capped).
+    auto = not raw.strip()
+    if not repos and not auto:
         return {"error": "Add one or more repos (owner/repo, one per line).", "runs": []}
 
     core = _core()
@@ -65,9 +106,29 @@ def fetch(
     acct_key = str((account or {}).get("id") or "public")
 
     max_per = max(1, int(options.get("max_results") or 3))
+    max_repos = min(MAX_REPOS_CAP, max(1, int(options.get("max_repos") or MAX_REPOS_DEFAULT)))
     data_dir = Path(ctx["data_dir"])
     data_dir.mkdir(parents=True, exist_ok=True)
-    key = re.sub(r"[^A-Za-z0-9]", "_", f"{acct_key}_{','.join(repos)}_{max_per}")[:120]
+
+    if auto:
+        try:
+            repos = _discover_repos(core, account, account_id, data_dir, acct_key)[:max_repos]
+        except Exception as err:
+            return {"error": core.coerce_error(err, account_name=account_name), "runs": []}
+        if not repos:
+            who = f" for '{account_name}'" if account_name else ""
+            return {
+                "error": (
+                    f"No repos found{who}. Add repos (owner/repo, one per line), or connect an "
+                    "account in GitHub Core (/plugins/github_core/) to scan its repos."
+                ),
+                "runs": [],
+            }
+        scope = f"auto{max_repos}"
+    else:
+        scope = ",".join(repos)
+
+    key = re.sub(r"[^A-Za-z0-9]", "_", f"{acct_key}_{scope}_{max_per}")[:120]
     cache = data_dir / f"runs_{key}.json"
     if not ctx.get("fresh") and cache.exists() and time.time() - cache.stat().st_mtime < CACHE_TTL_S:
         try:
@@ -130,6 +191,9 @@ def fetch(
 
     runs.sort(key=lambda r: r.get("updated_at") or "", reverse=True)
     result: dict[str, Any] = {"runs": runs}
+    if auto:
+        result["auto"] = True
+        result["scanned"] = len(repos)
     if errors:
         result["errors"] = errors
     with contextlib.suppress(OSError):

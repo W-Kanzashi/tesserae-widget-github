@@ -65,14 +65,17 @@ def fetch(
 
     account_id = (options.get("account") or "").strip() or None
     try:
-        account = core.resolve_account(account_id, require_auth=True, require_user_token=True)
+        account = core.resolve_account(account_id, require_auth=True)
     except Exception as err:
         return {"error": core.coerce_error(err)}
     assert account is not None
     account_name = str(account.get("name") or "")
     acct_key = str(account.get("id") or "default")
+    is_org_account = str(account.get("account_type") or "").lower() == "organization"
+    acct_login = str(account.get("username") or "").strip().lstrip("@")
+    explicit_user = (options.get("user") or "").strip().lstrip("@")
 
-    user = (options.get("user") or "").strip().lstrip("@") or core.get_username(account_id)
+    user = explicit_user or acct_login or core.get_username(account_id)
     if not user:
         return {
             "error": (
@@ -83,11 +86,13 @@ def fetch(
     if not USERNAME_RE.match(user):
         return {"error": f"'{user}' isn't a valid GitHub username."}
 
+    org_mode = is_org_account and not explicit_user
     stale_days = max(1, int(options.get("stale_days") or 7))
 
     data_dir = Path(ctx["data_dir"])
     data_dir.mkdir(parents=True, exist_ok=True)
-    safe_key = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{acct_key}_{user}")
+    mode_tag = "org" if org_mode else (f"org_{acct_login}" if is_org_account else "user")
+    safe_key = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{acct_key}_{mode_tag}_{user}")
     cache = data_dir / f"pr_count_{safe_key}.json"
     if not ctx.get("fresh") and cache.exists() and time.time() - cache.stat().st_mtime < CACHE_TTL_S:
         try:
@@ -98,12 +103,25 @@ def fetch(
             pass
 
     try:
-        yours = _bucket(core, f"is:pr is:open author:{user}", account_id=account_id)
-        review = _bucket(core, f"is:pr is:open review-requested:{user}", account_id=account_id)
+        if org_mode:
+            yours = _bucket(core, f"is:pr is:open -is:draft org:{user}", account_id=account_id)
+            review = _bucket(core, f"is:pr is:open is:draft org:{user}", account_id=account_id)
+        elif is_org_account and acct_login:
+            yours = _bucket(
+                core, f"is:pr is:open org:{acct_login} author:{explicit_user}", account_id=account_id
+            )
+            review = _bucket(
+                core,
+                f"is:pr is:open org:{acct_login} review-requested:{explicit_user}",
+                account_id=account_id,
+            )
+        else:
+            yours = _bucket(core, f"is:pr is:open author:{user}", account_id=account_id)
+            review = _bucket(core, f"is:pr is:open review-requested:{user}", account_id=account_id)
     except Exception as err:
         return {"error": core.coerce_error(err, account_name=account_name, user=user)}
 
-    result = {
+    result: dict[str, Any] = {
         "user": user,
         "yours": yours,
         "review": review,
@@ -111,5 +129,8 @@ def fetch(
         "oldest_days": max(yours["oldest_days"], review["oldest_days"]),
         "stale_days": stale_days,
     }
+    if org_mode:
+        result["yours_label"] = "Ready"
+        result["review_label"] = "Draft"
     cache.write_text(json.dumps(result), encoding="utf-8")
     return result

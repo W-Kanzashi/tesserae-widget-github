@@ -27,7 +27,7 @@ def _up_front(opts: list[dict]) -> list[str]:
 
 
 def test_every_widget_is_checked():
-    assert len(MANIFESTS) == 15
+    assert len(MANIFESTS) == 16
 
 
 @pytest.mark.parametrize("path", MANIFESTS, ids=lambda p: p.parent.name)

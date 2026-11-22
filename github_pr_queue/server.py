@@ -59,14 +59,16 @@ def fetch(
 
     account_id = (options.get("account") or "").strip() or None
     try:
-        account = core.resolve_account(account_id, require_auth=True, require_user_token=True)
+        account = core.resolve_account(account_id, require_auth=True)
     except Exception as err:
         return {"error": core.coerce_error(err), "yours": [], "review": []}
     assert account is not None
     account_name = str(account.get("name") or "")
     acct_key = str(account.get("id") or "default")
-
-    user = (options.get("user") or "").strip().lstrip("@") or core.get_username(account_id)
+    is_org_account = str(account.get("account_type") or "").lower() == "organization"
+    acct_login = str(account.get("username") or "").strip().lstrip("@")
+    explicit_user = (options.get("user") or "").strip().lstrip("@")
+    user = explicit_user or acct_login or core.get_username(account_id)
     if not user:
         return {
             "error": (
@@ -77,10 +79,12 @@ def fetch(
             "review": [],
         }
 
+    org_mode = is_org_account and not explicit_user
     max_results = max(1, int(options.get("max_results") or 6))
     data_dir = Path(ctx["data_dir"])
     data_dir.mkdir(parents=True, exist_ok=True)
-    safe_key = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{acct_key}_{user}_{max_results}")
+    mode_tag = "org" if org_mode else (f"org_{acct_login}" if is_org_account else "user")
+    safe_key = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{acct_key}_{mode_tag}_{user}_{max_results}")
     cache = data_dir / f"pr_{safe_key}.json"
     if not ctx.get("fresh") and cache.exists() and time.time() - cache.stat().st_mtime < CACHE_TTL_S:
         try:
@@ -96,8 +100,15 @@ def fetch(
         return [_slim(it) for it in (payload.get("items") or [])][:max_results]
 
     try:
-        yours = q(f"is:pr is:open author:{user}")
-        review = q(f"is:pr is:open review-requested:{user}")
+        if org_mode:
+            yours = q(f"is:pr is:open -is:draft org:{user}")
+            review = q(f"is:pr is:open is:draft org:{user}")
+        elif is_org_account and acct_login:
+            yours = q(f"is:pr is:open org:{acct_login} author:{explicit_user}")
+            review = q(f"is:pr is:open org:{acct_login} review-requested:{explicit_user}")
+        else:
+            yours = q(f"is:pr is:open author:{user}")
+            review = q(f"is:pr is:open review-requested:{user}")
     except Exception as err:
         return {
             "error": core.coerce_error(err, account_name=account_name, user=user),
@@ -105,7 +116,12 @@ def fetch(
             "review": [],
         }
 
-    result = {"user": user, "yours": yours, "review": review}
+    result: dict[str, Any] = {"user": user, "yours": yours, "review": review}
+    if org_mode:
+        result["yours_label"] = "Ready"
+        result["review_label"] = "Draft"
+        result["yours_meta"] = "READY"
+        result["review_meta"] = "DRAFT"
     with contextlib.suppress(OSError):
         cache.write_text(json.dumps(result), encoding="utf-8")
     return result

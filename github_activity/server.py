@@ -102,7 +102,8 @@ def fetch(
     account_name = str((account or {}).get("name") or "")
     acct_key = str((account or {}).get("id") or "public")
 
-    user = (options.get("user") or "").strip().lstrip("@") or core.get_username(account_id)
+    explicit_user = (options.get("user") or "").strip().lstrip("@")
+    user = explicit_user or core.get_username(account_id)
     if not user:
         return {
             "error": (
@@ -112,10 +113,15 @@ def fetch(
             "events": [],
         }
 
+    is_org_events = (
+        not explicit_user and str((account or {}).get("account_type") or "").lower() == "organization"
+    )
     max_events = int(options.get("max_events") or 10)
     data_dir = Path(ctx["data_dir"])
     data_dir.mkdir(parents=True, exist_ok=True)
-    safe_key = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{acct_key}_{user}")
+    safe_key = re.sub(
+        r"[^A-Za-z0-9_.-]", "_", f"{acct_key}_{'org' if is_org_events else 'user'}_{user}"
+    )
     cache_path = data_dir / f"events_{safe_key}.json"
     if not ctx.get("fresh"):
         cached = _cached(cache_path)
@@ -123,11 +129,13 @@ def fetch(
             cached["events"] = cached.get("events", [])[:max_events]
             return cached
 
+    events_url = (
+        f"https://api.github.com/orgs/{user}/events?per_page=100"
+        if is_org_events
+        else f"https://api.github.com/users/{user}/events/public?per_page=100"
+    )
     try:
-        raw = core.request_json(
-            f"https://api.github.com/users/{user}/events/public?per_page=100",
-            account_id=account_id,
-        )
+        raw = core.request_json(events_url, account_id=account_id)
     except Exception as err:
         return {
             "error": core.coerce_error(err, account_name=account_name, user=user),

@@ -93,14 +93,26 @@ def fetch(
 
     account_id = (options.get("account") or "").strip() or None
     try:
-        account = core.resolve_account(account_id, require_auth=True, require_user_token=True)
+        account = core.resolve_account(account_id, require_auth=True)
     except Exception as err:
         return {"error": core.coerce_error(err)}
     assert account is not None
     account_name = str(account.get("name") or "")
     acct_key = str(account.get("id") or "default")
+    is_org_account = str(account.get("account_type") or "").lower() == "organization"
+    explicit_user = (options.get("user") or "").strip().lstrip("@")
 
-    user = (options.get("user") or "").strip().lstrip("@") or core.get_username(account_id)
+    if is_org_account and not explicit_user:
+        org_login = str(account.get("username") or account_name)
+        return {
+            "error": (
+                f"GitHub only provides contribution streaks for individual users, not organizations "
+                f"(@{org_login}). Enter a personal GitHub username in this widget's Username option, "
+                "or select a user account."
+            )
+        }
+
+    user = explicit_user or core.get_username(account_id)
     if not user:
         return {
             "error": (
@@ -146,6 +158,9 @@ def fetch(
         "longest_streak": _longest_streak(days),
         "today_count": int((today or {}).get("count") or 0),
         "year_total": int(cal.get("totalContributions") or 0),
+        # Installation tokens act as the app, not the user, so GitHub may leave
+        # out the user's private contributions.
+        "public_only": str(account.get("auth_type") or "") == "github_app_installation",
     }
     cache.write_text(json.dumps(result), encoding="utf-8")
     return result

@@ -414,7 +414,21 @@ def _consume_state(state: str, *, expected_kind: str) -> dict[str, Any] | None:
 # ----- public serialization helpers ----------------------------------
 
 
-def _app_public(raw: dict[str, Any], box: Any = None) -> dict[str, Any]:
+def _pat_kind(token: str) -> str:
+    clean = (token or "").strip()
+    if clean.startswith("github_pat_"):
+        return "Fine-grained"
+    if clean.startswith("ghp_"):
+        return "Classic"
+    return ""
+
+
+def _app_public(
+    raw: dict[str, Any],
+    box: Any = None,
+    *,
+    account_count: int = 0,
+) -> dict[str, Any]:
     unreadable = False
     for key in ("pem_secret", "client_secret_secret"):
         stored = str(raw.get(key) or "")
@@ -436,6 +450,7 @@ def _app_public(raw: dict[str, Any], box: Any = None) -> dict[str, Any]:
         "has_oauth": bool(raw.get("client_id") and raw.get("client_secret_secret")),
         "has_pem": bool(raw.get("pem_secret")),
         "owner": str(raw.get("owner") or ""),
+        "account_count": account_count,
         "secret_unreadable": unreadable,
         "created_at": str(raw.get("created_at") or ""),
         "updated_at": str(raw.get("updated_at") or ""),
@@ -458,13 +473,16 @@ def _account_public(raw: dict[str, Any], apps_by_id: dict[str, dict[str, Any]], 
     auth_type = str(raw.get("auth_type") or "pat")
     account_type = str(raw.get("account_type") or "User")
     masked = ""
+    pat_kind = ""
     unreadable = False
 
     if auth_type == "pat":
         stored = str(raw.get("pat_secret") or "")
         if stored:
             try:
-                masked = mask_secret(_unwrap_secret(stored, box))
+                plaintext = _unwrap_secret(stored, box)
+                masked = mask_secret(plaintext)
+                pat_kind = _pat_kind(plaintext)
             except SecretBoxError:
                 unreadable = True
     elif auth_type == "github_app_user":
@@ -494,6 +512,7 @@ def _account_public(raw: dict[str, Any], apps_by_id: dict[str, dict[str, Any]], 
         "name": str(raw.get("name") or ""),
         "auth_type": auth_type,
         "auth_label": _auth_type_label(auth_type, account_type),
+        "pat_kind": pat_kind,
         "account_type": account_type,
         "username": str(raw.get("username") or ""),
         "app_ref": app_ref,
@@ -517,7 +536,12 @@ def _account_public(raw: dict[str, Any], apps_by_id: dict[str, dict[str, Any]], 
 def list_apps(*, data_dir: Path | None = None) -> list[dict[str, Any]]:
     box = _secret_box()
     data = _load_raw(data_dir)
-    return [_app_public(a, box) for a in data["apps"]]
+    counts: dict[str, int] = {}
+    for acc in data["accounts"]:
+        ref = str(acc.get("app_ref") or "")
+        if ref:
+            counts[ref] = counts.get(ref, 0) + 1
+    return [_app_public(a, box, account_count=counts.get(str(a.get("id") or ""), 0)) for a in data["apps"]]
 
 
 def _get_app_secrets(app_ref: str, *, data_dir: Path | None = None) -> dict[str, Any]:
@@ -685,27 +709,11 @@ def convert_manifest_code(code: str, *, data_dir: Path | None = None) -> dict[st
     )
 
 
-def create_app_manual(
-    *,
-    name: str,
-    app_id: str,
-    pem: str,
-    client_id: str = "",
-    client_secret: str = "",
-    data_dir: Path | None = None,
-) -> dict[str, Any]:
-    """Register an existing GitHub App manually and probe ``GET /app`` for metadata."""
-    clean_name = (name or "").strip()
-    clean_app_id = str(app_id or "").strip()
-    clean_pem = (pem or "").strip()
-    validate_private_key_pem(clean_pem)
-
-    slug = ""
-    html_url = ""
-    owner = ""
-    # Best-effort metadata lookup via App JWT so install_url is populated immediately.
+def _probe_app_metadata(app_id: str, pem: str) -> dict[str, str]:
+    """Best-effort ``GET /app`` probe using an App JWT to fetch slug/url/owner."""
+    out = {"slug": "", "html_url": "", "owner": "", "name": ""}
     with contextlib.suppress(Exception):
-        app_jwt = build_app_jwt(clean_app_id, clean_pem)
+        app_jwt = build_app_jwt(app_id, pem)
         req = urllib.request.Request(
             f"{GITHUB_API_BASE}/app",
             headers={
@@ -719,12 +727,35 @@ def create_app_manual(
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
             meta = json.loads(_decode_body(resp).decode("utf-8"))
         if isinstance(meta, dict):
-            slug = str(meta.get("slug") or "")
-            html_url = str(meta.get("html_url") or "")
-            if not clean_name and meta.get("name"):
-                clean_name = str(meta["name"])
+            out["slug"] = str(meta.get("slug") or "")
+            out["html_url"] = str(meta.get("html_url") or "")
+            if meta.get("name"):
+                out["name"] = str(meta["name"])
             if isinstance(meta.get("owner"), dict):
-                owner = str(meta["owner"].get("login") or "")
+                out["owner"] = str(meta["owner"].get("login") or "")
+    return out
+
+
+def create_app_manual(
+    *,
+    name: str,
+    app_id: str,
+    pem: str,
+    client_id: str = "",
+    client_secret: str = "",
+    data_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Register an existing GitHub App manually and probe ``GET /app`` for metadata."""
+    clean_name = (name or "").strip()
+    clean_app_id = str(app_id or "").strip()
+    clean_pem = (pem or "").strip()
+    if not clean_app_id or not clean_app_id.isdigit():
+        raise ValueError("GitHub App ID must be numeric.")
+    validate_private_key_pem(clean_pem)
+
+    meta = _probe_app_metadata(clean_app_id, clean_pem)
+    if not clean_name and meta["name"]:
+        clean_name = meta["name"]
 
     return _upsert_app(
         name=clean_name or f"GitHub App {clean_app_id}",
@@ -732,25 +763,200 @@ def create_app_manual(
         pem=clean_pem,
         client_id=client_id,
         client_secret=client_secret,
-        slug=slug,
-        html_url=html_url,
-        owner=owner,
+        slug=meta["slug"],
+        html_url=meta["html_url"],
+        owner=meta["owner"],
         data_dir=data_dir,
     )
 
 
+def create_apps_manual_batch(
+    entries: list[dict[str, Any]],
+    *,
+    data_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Register one or multiple existing GitHub Apps manually in a single batch."""
+    created: list[dict[str, Any]] = []
+    errors: list[str] = []
+    populated = 0
+
+    for idx, entry in enumerate(entries, start=1):
+        name = str(entry.get("name") or "").strip()
+        app_id = str(entry.get("app_id") or "").strip()
+        client_id = str(entry.get("client_id") or "").strip()
+        client_secret = str(entry.get("client_secret") or "").strip()
+        pem = str(entry.get("pem") or "").strip()
+        if not any((name, app_id, client_id, client_secret, pem)):
+            continue
+        populated += 1
+        try:
+            app = create_app_manual(
+                name=name,
+                app_id=app_id,
+                pem=pem,
+                client_id=client_id,
+                client_secret=client_secret,
+                data_dir=data_dir,
+            )
+            created.append(app)
+        except (ValueError, GithubCoreError) as err:
+            label = name or (f"App ID {app_id}" if app_id else f"App #{idx}")
+            errors.append(f"{label}: {err}")
+
+    if populated == 0:
+        errors.append("Enter at least one GitHub App to register.")
+    return {"created": created, "errors": errors}
+
+
+def update_app(
+    app_ref: str,
+    *,
+    name: str | None = None,
+    app_id: str | None = None,
+    pem: str | None = None,
+    client_id: str | None = None,
+    client_secret: str | None = None,
+    data_dir: Path | None = None,
+) -> dict[str, Any] | None:
+    """Update a registered GitHub App's name, ID, OAuth credentials, or PEM key."""
+    box = _secret_box()
+    data = _load_raw(data_dir)
+    record = next((a for a in data["apps"] if str(a.get("id") or "") == app_ref), None)
+    if record is None:
+        return None
+
+    creds_changed = False
+    if name is not None:
+        clean_name = name.strip()
+        if not clean_name:
+            raise ValueError("GitHub App name is required.")
+        record["name"] = clean_name
+
+    if app_id is not None and app_id.strip():
+        clean_app_id = app_id.strip()
+        if not clean_app_id.isdigit():
+            raise ValueError("GitHub App ID must be numeric.")
+        duplicate = next(
+            (
+                a
+                for a in data["apps"]
+                if str(a.get("id") or "") != app_ref and str(a.get("app_id") or "") == clean_app_id
+            ),
+            None,
+        )
+        if duplicate is not None:
+            raise ValueError(
+                f"GitHub App ID {clean_app_id} is already registered under '{duplicate.get('name') or duplicate.get('id')}'."
+            )
+        if clean_app_id != str(record.get("app_id") or ""):
+            record["app_id"] = clean_app_id
+            creds_changed = True
+
+    if client_id is not None:
+        record["client_id"] = client_id.strip()
+
+    if client_secret is not None and client_secret.strip():
+        record["client_secret_secret"] = _wrap_secret(client_secret.strip(), box)
+
+    new_pem = (pem or "").strip() if pem is not None else ""
+    if new_pem:
+        validate_private_key_pem(new_pem)
+        record["pem_secret"] = _wrap_secret(new_pem, box)
+        creds_changed = True
+
+    if creds_changed:
+        effective_pem = new_pem
+        if not effective_pem:
+            with contextlib.suppress(SecretBoxError):
+                effective_pem = _unwrap_secret(str(record.get("pem_secret") or ""), box)
+        if effective_pem:
+            meta = _probe_app_metadata(str(record.get("app_id") or ""), effective_pem)
+            if meta["slug"]:
+                record["slug"] = meta["slug"]
+            if meta["html_url"]:
+                record["html_url"] = meta["html_url"]
+            if meta["owner"]:
+                record["owner"] = meta["owner"]
+        with _INSTALL_TOKEN_LOCK:
+            for key in [k for k in _INSTALL_TOKEN_CACHE if k[0] == app_ref]:
+                _INSTALL_TOKEN_CACHE.pop(key, None)
+
+    record["updated_at"] = _now_iso()
+    record["last_error"] = None
+    _save_raw(data, data_dir)
+    count = sum(1 for acc in data["accounts"] if str(acc.get("app_ref") or "") == app_ref)
+    return _app_public(record, box, account_count=count)
+
+
+def test_app(app_ref: str, *, data_dir: Path | None = None) -> dict[str, Any]:
+    """Verify a GitHub App's App ID + PEM private key via ``GET /app``."""
+    try:
+        app_secrets = _get_app_secrets(app_ref, data_dir=data_dir)
+    except GithubCoreError as err:
+        return {"ok": False, "slug": None, "owner": None, "detail": None, "error": err.message}
+
+    try:
+        meta = _app_jwt_request(app_secrets, f"{GITHUB_API_BASE}/app", method="GET")
+    except Exception as err:
+        msg = coerce_error(err, account_name=app_secrets["name"], endpoint="GET /app")
+        data = _load_raw(data_dir)
+        for a in data["apps"]:
+            if str(a.get("id") or "") == app_ref:
+                a["last_error"] = msg
+        _save_raw(data, data_dir)
+        return {"ok": False, "slug": None, "owner": None, "detail": None, "error": msg}
+
+    slug = str((meta or {}).get("slug") or app_secrets["slug"])
+    html_url = str((meta or {}).get("html_url") or app_secrets["html_url"])
+    owner_obj = (meta or {}).get("owner") if isinstance((meta or {}).get("owner"), dict) else {}
+    owner = str(owner_obj.get("login") or app_secrets["owner"])
+    installs = (meta or {}).get("installations_count")
+
+    data = _load_raw(data_dir)
+    now = _now_iso()
+    for a in data["apps"]:
+        if str(a.get("id") or "") == app_ref:
+            if slug:
+                a["slug"] = slug
+            if html_url:
+                a["html_url"] = html_url
+            if owner:
+                a["owner"] = owner
+            a["updated_at"] = now
+            a["last_error"] = None
+    _save_raw(data, data_dir)
+
+    parts: list[str] = []
+    if slug:
+        parts.append(slug)
+    if owner:
+        parts.append(f"owner @{owner}")
+    if isinstance(installs, int):
+        parts.append(f"{installs} installation{'s' if installs != 1 else ''}")
+    return {
+        "ok": True,
+        "slug": slug or None,
+        "owner": owner or None,
+        "detail": " · ".join(parts) or "OK",
+        "error": None,
+    }
+
+
 def delete_app(app_ref: str, *, data_dir: Path | None = None) -> bool:
-    """Delete a registered GitHub App and any installation accounts bound to it."""
+    """Delete a registered GitHub App and all accounts bound to it."""
     data = _load_raw(data_dir)
     before = len(data["apps"])
     data["apps"] = [a for a in data["apps"] if str(a.get("id") or "") != app_ref]
     if len(data["apps"]) == before:
         return False
-    # Remove installation accounts tied to this app (they cannot mint tokens without it).
+    # Remove installation and OAuth user accounts tied to this app (they depend on its credentials).
     data["accounts"] = [
         a
         for a in data["accounts"]
-        if not (str(a.get("app_ref") or "") == app_ref and a.get("auth_type") == "github_app_installation")
+        if not (
+            str(a.get("app_ref") or "") == app_ref
+            and str(a.get("auth_type") or "").startswith("github_app_")
+        )
     ]
     with _INSTALL_TOKEN_LOCK:
         for key in [k for k in _INSTALL_TOKEN_CACHE if k[0] == app_ref]:
@@ -825,6 +1031,9 @@ def sync_app_installations(app_ref: str, *, data_dir: Path | None = None) -> lis
         acc_type = str(acc_obj.get("type") or "User").strip()
         repo_sel = str(inst.get("repository_selection") or "")
         default_name = f"{login} (Org)" if acc_type.lower() == "organization" else f"{login} (App)"
+        taken_names = {str(a.get("name") or "").lower() for a in data["accounts"]}
+        if login and default_name.lower() in taken_names:
+            default_name = f"{login} ({app_secrets['name']})"
 
         existing = next(
             (
@@ -882,6 +1091,28 @@ def sync_app_installations(app_ref: str, *, data_dir: Path | None = None) -> lis
     apps_by_id = {str(a.get("id") or ""): a for a in data["apps"]}
     box = _secret_box()
     return [_account_public(r, apps_by_id, box) for r in synced]
+
+
+def sync_all_apps(*, data_dir: Path | None = None) -> dict[str, Any]:
+    """Sync installations across every registered GitHub App."""
+    data = _load_raw(data_dir)
+    synced_apps = 0
+    total_installations = 0
+    errors: list[str] = []
+    for app_rec in data["apps"]:
+        app_ref = str(app_rec.get("id") or "")
+        app_name = str(app_rec.get("name") or app_ref)
+        try:
+            items = sync_app_installations(app_ref, data_dir=data_dir)
+            synced_apps += 1
+            total_installations += len(items)
+        except GithubCoreError as err:
+            errors.append(f"{app_name}: {err.message}")
+    return {
+        "synced_apps": synced_apps,
+        "total_installations": total_installations,
+        "errors": errors,
+    }
 
 
 def mint_installation_token(
@@ -1085,9 +1316,13 @@ def exchange_oauth_code(
         existing["last_error"] = None
         record = existing
     else:
+        default_name = f"@{username}" if username else f"{app_secrets['name']} user"
+        taken_names = {str(a.get("name") or "").lower() for a in data["accounts"]}
+        if username and default_name.lower() in taken_names:
+            default_name = f"@{username} ({app_secrets['name']})"
         record = {
             "id": _unique_id(data["accounts"], _slugify(username or app_secrets["name"])),
-            "name": f"@{username}" if username else f"{app_secrets['name']} user",
+            "name": default_name,
             "auth_type": "github_app_user",
             "app_ref": app_ref,
             "username": username,
@@ -1215,10 +1450,17 @@ def list_accounts(*, data_dir: Path | None = None) -> list[dict[str, Any]]:
     return [_account_public(acc, apps_by_id, box) for acc in data["accounts"]]
 
 
-def create_account(name: str, pat: str, *, data_dir: Path | None = None) -> dict[str, Any]:
-    """Create and persist a fallback Personal Access Token account."""
+def create_account(
+    name: str,
+    pat: str,
+    *,
+    username: str = "",
+    data_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Create and persist a Personal Access Token account."""
     clean_name = (name or "").strip()
     clean_pat = (pat or "").strip()
+    clean_user = (username or "").strip().lstrip("@")
     if not clean_name:
         raise ValueError("GitHub Account name is required.")
     if not clean_pat:
@@ -1233,7 +1475,7 @@ def create_account(name: str, pat: str, *, data_dir: Path | None = None) -> dict
         "auth_type": "pat",
         "account_type": "User",
         "pat_secret": _wrap_secret(clean_pat, box),
-        "username": "",
+        "username": clean_user,
         "created_at": now,
         "updated_at": now,
         "last_tested_at": None,
@@ -1245,14 +1487,59 @@ def create_account(name: str, pat: str, *, data_dir: Path | None = None) -> dict
     return _account_public(record, apps_by_id, box)
 
 
+def create_accounts_batch(
+    entries: list[dict[str, Any]],
+    *,
+    verify: bool = False,
+    data_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Create one or multiple Personal Access Token accounts in a single batch."""
+    created: list[dict[str, Any]] = []
+    verified = 0
+    errors: list[str] = []
+    populated = 0
+
+    for idx, entry in enumerate(entries, start=1):
+        name = str(entry.get("name") or "").strip()
+        pat = str(entry.get("pat") or "").strip()
+        username = str(entry.get("username") or "").strip().lstrip("@")
+        if not any((name, pat, username)):
+            continue
+        populated += 1
+        try:
+            acc = create_account(name, pat, username=username, data_dir=data_dir)
+        except ValueError as err:
+            label = name or f"PAT #{idx}"
+            errors.append(f"{label}: {err}")
+            continue
+        if verify:
+            res = test_connection(acc["id"], data_dir=data_dir)
+            if res["ok"]:
+                verified += 1
+            elif res.get("error"):
+                errors.append(f"{acc['name']} (saved, test failed): {res['error']}")
+            refreshed = next(
+                (a for a in list_accounts(data_dir=data_dir) if a["id"] == acc["id"]),
+                acc,
+            )
+            created.append(refreshed)
+        else:
+            created.append(acc)
+
+    if populated == 0:
+        errors.append("Enter at least one Personal Access Token.")
+    return {"created": created, "verified": verified, "errors": errors}
+
+
 def update_account(
     account_id: str,
     *,
     name: str | None = None,
     pat: str | None = None,
+    username: str | None = None,
     data_dir: Path | None = None,
 ) -> dict[str, Any] | None:
-    """Rename a saved account and/or update a PAT account's token."""
+    """Rename a saved account and/or update a PAT account's token or username."""
     box = _secret_box()
     data = _load_raw(data_dir)
     record = next((a for a in data["accounts"] if str(a.get("id") or "") == account_id), None)
@@ -1268,7 +1555,25 @@ def update_account(
         record["username"] = ""
         record["last_tested_at"] = None
         record["last_error"] = None
+    if username is not None and record.get("auth_type", "pat") == "pat":
+        clean_user = username.strip().lstrip("@")
+        if clean_user or not (pat and pat.strip()):
+            record["username"] = clean_user
     record["updated_at"] = _now_iso()
+    _save_raw(data, data_dir)
+    apps_by_id = {str(a.get("id") or ""): a for a in data["apps"]}
+    return _account_public(record, apps_by_id, box)
+
+
+def set_default_account(account_id: str, *, data_dir: Path | None = None) -> dict[str, Any] | None:
+    """Move ``account_id`` to the top of the list so widgets use it as Default."""
+    box = _secret_box()
+    data = _load_raw(data_dir)
+    idx = next((i for i, a in enumerate(data["accounts"]) if str(a.get("id") or "") == account_id), None)
+    if idx is None:
+        return None
+    record = data["accounts"].pop(idx)
+    data["accounts"].insert(0, record)
     _save_raw(data, data_dir)
     apps_by_id = {str(a.get("id") or ""): a for a in data["apps"]}
     return _account_public(record, apps_by_id, box)
@@ -1462,13 +1767,21 @@ def account_choices(
             ]
         return [{"value": "", "label": "Public (no account connected)"}]
 
+    apps = list_apps(data_dir=data_dir)
+    multi_app = len(apps) > 1
+
     def _fmt(acc: dict[str, Any]) -> str:
         name = acc["name"]
         user = acc["username"]
         kind = acc["auth_label"]
+        app_name = acc.get("app_name") or ""
         if user and f"@{user}" not in name and user.lower() not in name.lower():
-            return f"{name} (@{user}) · {kind}"
-        return f"{name} · {kind}"
+            base = f"{name} (@{user})"
+        else:
+            base = name
+        if multi_app and app_name and app_name.lower() not in base.lower():
+            return f"{base} · {kind} · {app_name}"
+        return f"{base} · {kind}"
 
     out: list[dict[str, Any]] = [
         {"value": "", "label": f"Default ({_fmt(accounts[0])})"},
@@ -1643,10 +1956,14 @@ def list_accessible_repos(
     * ``github_app_installation`` → ``GET /installation/repositories`` (org & personal repos)
     * ``github_app_user`` / ``pat`` → ``GET /user/repos`` (owned, collaborator & org repos)
     * Unauthenticated fallback → ``GET /users/{user}/repos``
+
+    Results are ordered most recently pushed first for every auth type
+    (``/installation/repositories`` has no ``sort`` parameter, so it is sorted here).
     """
     account = resolve_account(account_id, require_auth=False, data_dir=data_dir)
     out: list[str] = []
     seen: set[str] = set()
+    pushed: dict[str, str] = {}
 
     for page in range(1, max_pages + 1):
         if account is not None and account.get("auth_type") == "github_app_installation":
@@ -1685,8 +2002,11 @@ def list_accessible_repos(
             if full and key not in seen:
                 seen.add(key)
                 out.append(full)
+                pushed[full] = str(repo.get("pushed_at") or "")
         if len(batch) < 100:
             break
+    # Stable sort: keeps API order for repos without ``pushed_at``.
+    out.sort(key=lambda full: pushed.get(full, ""), reverse=True)
     return out
 
 
@@ -1909,91 +2229,256 @@ def test_connection(account_id: str, *, data_dir: Path | None = None) -> dict[st
     return {"ok": False, "username": None, "detail": None, "error": error_msg}
 
 
+def test_all_accounts(*, data_dir: Path | None = None) -> dict[str, Any]:
+    """Run ``test_connection`` across every saved GitHub account."""
+    accounts = list_accounts(data_dir=data_dir)
+    ok_count = 0
+    failed: list[tuple[str, str]] = []
+    for acc in accounts:
+        res = test_connection(acc["id"], data_dir=data_dir)
+        if res["ok"]:
+            ok_count += 1
+        else:
+            failed.append((acc["name"], str(res.get("error") or "Connection failed")))
+    return {"tested": len(accounts), "ok_count": ok_count, "failed": failed}
+
+
+def _manifest_action_url(org: str, state: str) -> str:
+    if org:
+        return (
+            f"{GITHUB_WEB_BASE}/organizations/{urllib.parse.quote(org, safe='')}"
+            f"/settings/apps/new?state={urllib.parse.quote(state, safe='')}"
+        )
+    return f"{GITHUB_WEB_BASE}/settings/apps/new?state={urllib.parse.quote(state, safe='')}"
+
+
 # ----- admin blueprint -----------------------------------------------
 
 
 def blueprint() -> Blueprint:
     bp = Blueprint("github_core_admin", __name__, template_folder="templates")
 
-    @bp.get("/")
-    def index() -> str:
+    def _render_manifest_step(
+        spec: dict[str, str],
+        *,
+        remaining: list[dict[str, str]],
+        step: int,
+        total: int,
+        created_names: list[str],
+        prev_created: str = "",
+    ) -> str:
+        base_url = _public_base_url()
+        manifest = build_app_manifest(spec["name"], base_url)
+        state = _create_state(
+            "manifest",
+            {
+                "org": spec["org"],
+                "name": spec["name"],
+                "remaining": remaining,
+                "step": step,
+                "total": total,
+                "created_names": created_names,
+            },
+        )
         return render_template(
-            "github_core/index.html",
-            apps=list_apps(),
-            accounts=list_accounts(),
-            legacy=_legacy_settings(),
-            base_url=_public_base_url(),
+            "github_core/manifest_post.html",
+            action_url=_manifest_action_url(spec["org"], state),
+            manifest_json=json.dumps(manifest),
+            app_name=spec["name"],
+            org=spec["org"],
+            step=step,
+            total=total,
+            prev_created=prev_created,
+            cancel_url=url_for("github_core_admin.index"),
         )
 
-    # -- GitHub App Manifest 1-click creation --
+    @bp.get("/")
+    def index() -> str:
+        apps = list_apps()
+        accounts = list_accounts()
+        pat_accounts = [a for a in accounts if a["auth_type"] == "pat"]
+        return render_template(
+            "github_core/index.html",
+            apps=apps,
+            accounts=accounts,
+            pat_accounts=pat_accounts,
+            legacy=_legacy_settings(),
+            base_url=_public_base_url(),
+            suggested_app_name="" if apps else "Tesserae GitHub",
+        )
+
+    # -- GitHub App Manifest 1-click creation (single or batch queue) --
 
     @bp.post("/apps/manifest/start")
     def manifest_start_route() -> str | Response:
-        app_name = (request.form.get("name") or "").strip() or "Tesserae GitHub"
-        org = (request.form.get("org") or "").strip().lstrip("@")
-        if org and not _OWNER_RE.match(org):
-            flash(f"Invalid GitHub organization name '{org}'.", "warn")
-            return redirect(url_for("github_core_admin.index"))
+        raw_names = request.form.getlist("name")
+        raw_orgs = request.form.getlist("org")
+        count = max(len(raw_names), len(raw_orgs), 1)
+        specs: list[dict[str, str]] = []
 
-        base_url = _public_base_url()
-        manifest = build_app_manifest(app_name, base_url)
-        state = _create_state("manifest", {"org": org, "name": app_name})
-        if org:
-            action_url = (
-                f"{GITHUB_WEB_BASE}/organizations/{urllib.parse.quote(org, safe='')}"
-                f"/settings/apps/new?state={urllib.parse.quote(state, safe='')}"
-            )
-        else:
-            action_url = f"{GITHUB_WEB_BASE}/settings/apps/new?state={urllib.parse.quote(state, safe='')}"
+        for idx in range(count):
+            name = (raw_names[idx] if idx < len(raw_names) else "").strip()
+            org = (raw_orgs[idx] if idx < len(raw_orgs) else "").strip().lstrip("@")
+            if org and not _OWNER_RE.match(org):
+                flash(f"Invalid GitHub organization name '{org}'.", "warn")
+                return redirect(url_for("github_core_admin.index"))
+            if not name and not org:
+                continue
+            if not name:
+                name = f"Tesserae {org}" if org else "Tesserae GitHub"
+            specs.append({"name": name, "org": org})
 
-        return render_template(
-            "github_core/manifest_post.html",
-            action_url=action_url,
-            manifest_json=json.dumps(manifest),
+        if not specs:
+            specs.append({"name": "Tesserae GitHub", "org": ""})
+
+        return _render_manifest_step(
+            specs[0],
+            remaining=specs[1:],
+            step=1,
+            total=len(specs),
+            created_names=[],
         )
 
     @bp.get("/apps/manifest/callback")
-    def manifest_callback_route() -> Response:
+    def manifest_callback_route() -> str | Response:
         code = (request.args.get("code") or "").strip()
         state = (request.args.get("state") or "").strip()
         pending = _consume_state(state, expected_kind="manifest")
         if pending is None:
             flash("GitHub App creation state expired or invalid. Try creating the app again.", "warn")
             return redirect(url_for("github_core_admin.index"))
+
+        created_names = [str(n) for n in (pending.get("created_names") or []) if str(n)]
+        remaining = [
+            {"name": str(item.get("name") or "Tesserae GitHub"), "org": str(item.get("org") or "")}
+            for item in (pending.get("remaining") or [])
+            if isinstance(item, dict)
+        ]
+        step = int(pending.get("step") or 1)
+        total = int(pending.get("total") or (step + len(remaining)))
+
         try:
             created = convert_manifest_code(code)
         except GithubCoreError as err:
-            flash(f"Could not finish creating GitHub App: {err.message}", "warn")
+            if created_names:
+                flash(
+                    f"Created {len(created_names)} GitHub App(s) ({', '.join(created_names)}), "
+                    f"then failed on step {step}: {err.message}",
+                    "warn",
+                )
+            else:
+                flash(f"Could not finish creating GitHub App: {err.message}", "warn")
             return redirect(url_for("github_core_admin.index"))
 
-        flash(
-            f"Created GitHub App '{created['name']}' (App ID {created['app_id']}). "
-            "Next, click 'Install on GitHub' to choose your personal account or organizations.",
-            "ok",
-        )
+        created_names.append(created["name"])
+        if remaining:
+            return _render_manifest_step(
+                remaining[0],
+                remaining=remaining[1:],
+                step=step + 1,
+                total=total,
+                created_names=created_names,
+                prev_created=created["name"],
+            )
+
+        if len(created_names) > 1:
+            flash(
+                f"Created {len(created_names)} GitHub Apps: {', '.join(created_names)}. "
+                "Next, click 'Install on GitHub' on each app to attach your personal account or organizations.",
+                "ok",
+            )
+        else:
+            flash(
+                f"Created GitHub App '{created['name']}' (App ID {created['app_id']}). "
+                "Next, click 'Install on GitHub' to choose your personal account or organizations.",
+                "ok",
+            )
         return redirect(url_for("github_core_admin.index"))
 
-    # -- Manual GitHub App registration --
+    # -- Manual GitHub App registration (single or batch) & editing --
 
     @bp.post("/apps/manual")
     def create_app_manual_route() -> Response:
+        names = request.form.getlist("name")
+        app_ids = request.form.getlist("app_id")
+        client_ids = request.form.getlist("client_id")
+        client_secrets = request.form.getlist("client_secret")
+        pems = request.form.getlist("pem")
+        count = max(len(names), len(app_ids), len(client_ids), len(client_secrets), len(pems))
+        entries = [
+            {
+                "name": names[i] if i < len(names) else "",
+                "app_id": app_ids[i] if i < len(app_ids) else "",
+                "client_id": client_ids[i] if i < len(client_ids) else "",
+                "client_secret": client_secrets[i] if i < len(client_secrets) else "",
+                "pem": pems[i] if i < len(pems) else "",
+            }
+            for i in range(count)
+        ]
+        result = create_apps_manual_batch(entries)
+        created = result["created"]
+        errors = result["errors"]
+
+        if len(created) == 1:
+            app = created[0]
+            flash(f"Saved GitHub App '{app['name']}' (App ID {app['app_id']}).", "ok")
+        elif len(created) > 1:
+            summary = ", ".join(f"{a['name']} (#{a['app_id']})" for a in created)
+            flash(f"Saved {len(created)} GitHub Apps: {summary}.", "ok")
+        if errors:
+            flash(" · ".join(errors), "warn")
+        return redirect(url_for("github_core_admin.index"))
+
+    @bp.post("/apps/<app_ref>/edit")
+    def edit_app_route(app_ref: str) -> Response:
         name = (request.form.get("name") or "").strip()
         app_id = (request.form.get("app_id") or "").strip()
-        client_id = (request.form.get("client_id") or "").strip()
+        client_id = request.form.get("client_id")
         client_secret = (request.form.get("client_secret") or "").strip()
         pem = (request.form.get("pem") or "").strip()
         try:
-            created = create_app_manual(
+            updated = update_app(
+                app_ref,
                 name=name,
-                app_id=app_id,
-                pem=pem,
-                client_id=client_id,
-                client_secret=client_secret,
+                app_id=app_id or None,
+                client_id=client_id if client_id is not None else None,
+                client_secret=client_secret or None,
+                pem=pem or None,
             )
         except (ValueError, GithubCoreError) as err:
             flash(str(err), "warn")
             return redirect(url_for("github_core_admin.index"))
-        flash(f"Saved GitHub App '{created['name']}' (App ID {created['app_id']}).", "ok")
+        if updated is None:
+            abort(404)
+        flash(f"Updated GitHub App '{updated['name']}' (App ID {updated['app_id']}).", "ok")
+        return redirect(url_for("github_core_admin.index"))
+
+    @bp.post("/apps/<app_ref>/test")
+    def test_app_route(app_ref: str) -> Response:
+        apps = list_apps()
+        match = next((a for a in apps if a["id"] == app_ref), None)
+        if match is None:
+            abort(404)
+        result = test_app(app_ref)
+        if result["ok"]:
+            flash(f"GitHub App '{match['name']}' verified ({result['detail']}).", "ok")
+        else:
+            flash(f"GitHub App test failed for '{match['name']}': {result['error']}", "warn")
+        return redirect(url_for("github_core_admin.index"))
+
+    @bp.post("/apps/sync-all")
+    def sync_all_apps_route() -> Response:
+        result = sync_all_apps()
+        if result["synced_apps"]:
+            flash(
+                f"Synced {result['total_installations']} installation(s) across "
+                f"{result['synced_apps']} GitHub App(s).",
+                "ok",
+            )
+        elif not result["errors"]:
+            flash("No GitHub Apps registered yet.", "warn")
+        if result["errors"]:
+            flash(" · ".join(result["errors"]), "warn")
         return redirect(url_for("github_core_admin.index"))
 
     @bp.post("/apps/<app_ref>/sync")
@@ -2089,31 +2574,92 @@ def blueprint() -> Blueprint:
     def delete_app_route(app_ref: str) -> Response:
         if not delete_app(app_ref):
             abort(404)
-        flash("Deleted GitHub App and its synced installation accounts.", "ok")
+        flash("Deleted GitHub App and its linked accounts.", "ok")
         return redirect(url_for("github_core_admin.index"))
 
-    # -- Fallback PAT & Account management --
+    # -- Personal Access Tokens (single or batch) & Account management --
 
     @bp.post("/accounts/pat")
     def create_pat_account_route() -> Response:
-        name = (request.form.get("name") or "").strip()
-        pat = (request.form.get("pat") or "").strip()
-        try:
-            created = create_account(name, pat)
-        except ValueError as err:
-            flash(str(err), "warn")
+        names = request.form.getlist("name")
+        pats = request.form.getlist("pat")
+        usernames = request.form.getlist("username")
+        verify = (request.form.get("verify_on_save") or "").strip().lower() in {"1", "true", "on", "yes"}
+        count = max(len(names), len(pats), len(usernames))
+        entries = [
+            {
+                "name": names[i] if i < len(names) else "",
+                "pat": pats[i] if i < len(pats) else "",
+                "username": usernames[i] if i < len(usernames) else "",
+            }
+            for i in range(count)
+        ]
+        result = create_accounts_batch(entries, verify=verify)
+        created = result["created"]
+        errors = result["errors"]
+
+        if len(created) == 1:
+            acc = created[0]
+            if verify and result["verified"] == 1 and acc.get("username"):
+                flash(f"Added and verified PAT account '{acc['name']}' (@{acc['username']}).", "ok")
+            else:
+                flash(f"Added PAT account '{acc['name']}'. Click 'Test' to verify and resolve its username.", "ok")
+        elif len(created) > 1:
+            names_str = ", ".join(a["name"] for a in created)
+            if verify:
+                flash(
+                    f"Added {len(created)} PAT accounts ({names_str}); verified {result['verified']}/{len(created)}.",
+                    "ok",
+                )
+            else:
+                flash(
+                    f"Added {len(created)} PAT accounts: {names_str}. Click 'Test all' to verify them.",
+                    "ok",
+                )
+        if errors:
+            flash(" · ".join(errors), "warn")
+        return redirect(url_for("github_core_admin.index"))
+
+    @bp.post("/accounts/test-all")
+    def test_all_accounts_route() -> Response:
+        result = test_all_accounts()
+        if not result["tested"]:
+            flash("No GitHub Accounts connected yet.", "warn")
             return redirect(url_for("github_core_admin.index"))
-        flash(f"Added PAT account '{created['name']}'. Click 'Test connection' to resolve its username.", "ok")
+        if not result["failed"]:
+            flash(f"All {result['ok_count']} GitHub Account(s) passed live connection tests.", "ok")
+        else:
+            if result["ok_count"]:
+                flash(
+                    f"Verified {result['ok_count']} of {result['tested']} GitHub Account(s).",
+                    "ok",
+                )
+            failed_msg = " · ".join(f"{name}: {err}" for name, err in result["failed"])
+            flash(f"Failed: {failed_msg}", "warn")
+        return redirect(url_for("github_core_admin.index"))
+
+    @bp.post("/accounts/<account_id>/default")
+    def set_default_account_route(account_id: str) -> Response:
+        updated = set_default_account(account_id)
+        if updated is None:
+            abort(404)
+        flash(f"Set '{updated['name']}' as the default GitHub Account.", "ok")
         return redirect(url_for("github_core_admin.index"))
 
     @bp.post("/accounts/<account_id>/edit")
     def edit_account_route(account_id: str) -> Response:
         name = (request.form.get("name") or "").strip()
         pat = (request.form.get("pat") or "").strip()
+        username = request.form.get("username")
         if not name:
             flash("Account name is required.", "warn")
             return redirect(url_for("github_core_admin.index"))
-        updated = update_account(account_id, name=name, pat=pat or None)
+        updated = update_account(
+            account_id,
+            name=name,
+            pat=pat or None,
+            username=username if username is not None else None,
+        )
         if updated is None:
             abort(404)
         flash(f"Updated GitHub Account '{updated['name']}'.", "ok")

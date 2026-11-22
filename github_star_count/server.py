@@ -17,7 +17,7 @@ USERNAME_RE = re.compile(r"^[A-Za-z0-9-]{1,39}$")
 
 _QUERY = """
 query($login: String!) {
-  user(login: $login) {
+  repositoryOwner(login: $login) {
     repositories(
       first: 100,
       ownerAffiliations: OWNER,
@@ -31,6 +31,38 @@ query($login: String!) {
   }
 }
 """
+
+
+def _fetch_installation_stars(
+    core: Any, *, owner: str, account_id: str | None
+) -> tuple[int, list[dict[str, Any]]]:
+    """Sum stars across non-fork repos owned by ``owner`` via ``/installation/repositories``."""
+    nodes: list[dict[str, Any]] = []
+    owner_lc = owner.lower()
+    for page in range(1, 11):
+        payload = core.request_json(
+            f"https://api.github.com/installation/repositories?per_page=100&page={page}",
+            account_id=account_id,
+        )
+        batch = (payload or {}).get("repositories") if isinstance(payload, dict) else []
+        if not isinstance(batch, list) or not batch:
+            break
+        for repo in batch:
+            if not isinstance(repo, dict) or repo.get("fork"):
+                continue
+            repo_owner = str(((repo.get("owner") or {}).get("login")) or "").lower()
+            if owner_lc and repo_owner and repo_owner != owner_lc:
+                continue
+            nodes.append(
+                {
+                    "name": str(repo.get("name") or ""),
+                    "stargazerCount": int(repo.get("stargazers_count") or 0),
+                    "url": str(repo.get("html_url") or ""),
+                }
+            )
+        if len(batch) < 100:
+            break
+    return len(nodes), nodes
 
 
 def _core() -> Any:
@@ -85,12 +117,13 @@ def fetch(
 
     account_id = (options.get("account") or "").strip() or None
     try:
-        account = core.resolve_account(account_id, require_auth=True, require_user_token=True)
+        account = core.resolve_account(account_id, require_auth=True)
     except Exception as err:
         return {"error": core.coerce_error(err)}
     assert account is not None
     account_name = str(account.get("name") or "")
     acct_key = str(account.get("id") or "default")
+    acct_login = str(account.get("username") or "").strip().lstrip("@")
 
     user = _resolve_user(options, core, account_id)
     if not user:
@@ -115,24 +148,36 @@ def fetch(
         except (json.JSONDecodeError, OSError):
             pass
 
-    try:
-        payload = core.request_graphql(_QUERY, {"login": user}, account_id=account_id)
-    except Exception as err:
-        return {"error": core.coerce_error(err, account_name=account_name, user=user)}
+    if (
+        account.get("auth_type") == "github_app_installation"
+        and acct_login
+        and user.lower() == acct_login.lower()
+    ):
+        try:
+            total_repos, nodes = _fetch_installation_stars(
+                core, owner=user, account_id=account_id
+            )
+        except Exception as err:
+            return {"error": core.coerce_error(err, account_name=account_name, user=user)}
+    else:
+        try:
+            payload = core.request_graphql(_QUERY, {"login": user}, account_id=account_id)
+        except Exception as err:
+            return {"error": core.coerce_error(err, account_name=account_name, user=user)}
 
-    gql_err = core.coerce_graphql_error(
-        payload, account_name=account_name, auth_type=str(account.get("auth_type") or "")
-    )
-    if gql_err:
-        return {"error": gql_err}
+        gql_err = core.coerce_graphql_error(
+            payload, account_name=account_name, auth_type=str(account.get("auth_type") or "")
+        )
+        if gql_err:
+            return {"error": gql_err}
 
-    user_node = (payload or {}).get("data", {}).get("user")
-    if not user_node:
-        return {"error": f"GitHub user '@{user}' was not found."}
+        owner_node = (payload or {}).get("data", {}).get("repositoryOwner")
+        if not owner_node:
+            return {"error": f"GitHub account '@{user}' was not found."}
 
-    repos_block = user_node.get("repositories") or {}
-    nodes = repos_block.get("nodes") or []
-    total_repos = int(repos_block.get("totalCount") or 0)
+        repos_block = owner_node.get("repositories") or {}
+        nodes = repos_block.get("nodes") or []
+        total_repos = int(repos_block.get("totalCount") or 0)
     total_stars = sum(int(n.get("stargazerCount") or 0) for n in nodes)
 
     top = sorted(nodes, key=lambda n: int(n.get("stargazerCount") or 0), reverse=True)[:3]
