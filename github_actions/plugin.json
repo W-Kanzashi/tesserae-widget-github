@@ -3,7 +3,7 @@
   "name": "GitHub, Actions",
   "version": "0.2.4",
   "kind": "widget",
-  "description": "Most recent CI runs across watched repos. Each workflow row pairs its conclusion icon + a workflow-type glyph (build / test / deploy / lint / docs / release / security / ci) with a mini timeline of the last 8 runs (bar height \u221d duration, colour \u221d conclusion) and the latest run's duration. Public repos work without a token; private repos require the PAT in Plugins \u2192 GitHub Core.",
+  "description": "Most recent CI runs across watched repos. Each workflow row pairs its conclusion icon + a workflow-type glyph (build / test / deploy / lint / docs / release / security / ci) with a mini timeline of the last 8 runs (bar height ∝ duration, colour ∝ conclusion) and the latest run's duration. Public repos work without a token; private repos require the PAT in Plugins → GitHub Core.",
   "icon": "ph-play-circle",
   "supports": {
     "sizes": [
@@ -13,6 +13,14 @@
     ]
   },
   "cell_options": [
+    {
+      "name": "account",
+      "type": "select",
+      "label": "Account",
+      "default": "",
+      "choices_from": "account",
+      "help": "Connected GitHub App or account from GitHub Core. Blank uses the default account, or public access if none is connected."
+    },
     {
       "name": "repos",
       "type": "textarea",
@@ -33,6 +41,7 @@
     "needs_network": true
   },
   "requires": [
-    "network:api.github.com"
+    "network:api.github.com",
+    "plugin:github_core"
   ]
 }

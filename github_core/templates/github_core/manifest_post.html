@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Redirecting to GitHub…</title>
+</head>
+<body style="font-family: system-ui, sans-serif; padding: 2rem;">
+  <p>Redirecting to GitHub to create your GitHub App…</p>
+  <form id="gh-manifest-form" method="post" action="{{ action_url }}">
+    <input type="hidden" name="manifest" value="{{ manifest_json }}">
+    <noscript>
+      <button type="submit">Continue to GitHub</button>
+    </noscript>
+  </form>
+  <script>document.getElementById("gh-manifest-form").submit();</script>
+</body>
+</html>

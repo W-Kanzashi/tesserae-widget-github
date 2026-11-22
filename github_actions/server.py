@@ -17,8 +17,19 @@ REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 HISTORY_PER_WORKFLOW = 8
 
 
-def _core():
-    return current_app.config["PLUGIN_REGISTRY"].get("github_core").server_module
+def _core() -> Any:
+    plugin = current_app.config["PLUGIN_REGISTRY"].get("github_core")
+    return plugin.server_module if plugin is not None else None
+
+
+def choices(name: str, options: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    del options
+    if name != "account":
+        return []
+    core = _core()
+    if core is None:
+        return [{"value": "", "label": "Install GitHub Core to configure accounts.", "note": True}]
+    return list(core.account_choices(require_auth=False))
 
 
 def _duration_s(start: str | None, end: str | None) -> int | None:
@@ -41,29 +52,39 @@ def fetch(
     if not repos:
         return {"error": "Add one or more repos (owner/repo, one per line).", "runs": []}
 
-    max_per = max(1, int(options.get("max_results") or 3))
     core = _core()
+    if core is None:
+        return {"error": "Install and enable GitHub Core to use this widget.", "runs": []}
+
+    account_id = (options.get("account") or "").strip() or None
+    try:
+        account = core.resolve_account(account_id, require_auth=False)
+    except Exception as err:
+        return {"error": core.coerce_error(err), "runs": []}
+    account_name = str((account or {}).get("name") or "")
+    acct_key = str((account or {}).get("id") or "public")
+
+    max_per = max(1, int(options.get("max_results") or 3))
     data_dir = Path(ctx["data_dir"])
     data_dir.mkdir(parents=True, exist_ok=True)
-    key = re.sub(r"[^A-Za-z0-9]", "_", f"{','.join(repos)}_{max_per}")[:120]
+    key = re.sub(r"[^A-Za-z0-9]", "_", f"{acct_key}_{','.join(repos)}_{max_per}")[:120]
     cache = data_dir / f"runs_{key}.json"
-    if cache.exists() and time.time() - cache.stat().st_mtime < CACHE_TTL_S:
+    if not ctx.get("fresh") and cache.exists() and time.time() - cache.stat().st_mtime < CACHE_TTL_S:
         try:
             return json.loads(cache.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             pass
 
     runs: list[dict[str, Any]] = []
+    errors: list[str] = []
     for repo in repos:
-        # Pull a wider window so we can group by workflow_name and
-        # attach a per-workflow history strip to each row. 30 runs is
-        # enough to give every workflow a small history without being
-        # so big that we burn the API rate limit.
         try:
             payload = core.request_json(
-                f"https://api.github.com/repos/{repo}/actions/runs?per_page=30"
+                f"https://api.github.com/repos/{repo}/actions/runs?per_page=30",
+                account_id=account_id,
             )
-        except Exception:
+        except Exception as err:
+            errors.append(core.coerce_error(err, account_name=account_name, repo=repo))
             continue
         all_runs = payload.get("workflow_runs") or []
         by_workflow: dict[str, list[dict[str, Any]]] = {}
@@ -84,8 +105,6 @@ def fetch(
                         "run_number": h.get("run_number"),
                     }
                 )
-            # Reverse to oldest-first so the strip reads left → right
-            # as time progressing toward the latest run on the right.
             history.reverse()
             selected.append(
                 {
@@ -103,14 +122,16 @@ def fetch(
                     "history": history,
                 }
             )
-        # max_per is now "max distinct workflows per repo", keeps the
-        # list focused on N workflows-being-watched per repo rather
-        # than N runs of the noisiest workflow.
         selected.sort(key=lambda r: r.get("updated_at") or "", reverse=True)
         runs.extend(selected[:max_per])
 
+    if not runs and errors:
+        return {"error": errors[0], "runs": []}
+
     runs.sort(key=lambda r: r.get("updated_at") or "", reverse=True)
-    result = {"runs": runs}
+    result: dict[str, Any] = {"runs": runs}
+    if errors:
+        result["errors"] = errors
     with contextlib.suppress(OSError):
         cache.write_text(json.dumps(result), encoding="utf-8")
     return result

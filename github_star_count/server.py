@@ -1,12 +1,4 @@
-"""github_star_count, hero total-stars widget.
-
-Single GraphQL call pulls the user's owned repositories with their
-stargazer counts; we sum the lot for the headline number and keep
-the top three named for the sub-line. A daily snapshot is appended
-to a per-user history file so the sparkline accumulates a real
-30-day curve over time without the cost of paginating every repo's
-stargazers endpoint on every render.
-"""
+"""github_star_count, hero total-stars widget."""
 
 from __future__ import annotations
 
@@ -42,11 +34,22 @@ query($login: String!) {
 
 
 def _core() -> Any:
-    return current_app.config["PLUGIN_REGISTRY"].get("github_core").server_module
+    plugin = current_app.config["PLUGIN_REGISTRY"].get("github_core")
+    return plugin.server_module if plugin is not None else None
 
 
-def _resolve_user(options: dict[str, Any], core: Any) -> str:
-    user = (options.get("user") or "").strip() or core.get_username()
+def choices(name: str, options: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    del options
+    if name != "account":
+        return []
+    core = _core()
+    if core is None:
+        return [{"value": "", "label": "Install GitHub Core to configure accounts.", "note": True}]
+    return list(core.account_choices(require_auth=True))
+
+
+def _resolve_user(options: dict[str, Any], core: Any, account_id: str | None) -> str:
+    user = (options.get("user") or "").strip().lstrip("@") or core.get_username(account_id)
     return user.strip()
 
 
@@ -63,9 +66,6 @@ def _read_history(path: Path) -> list[dict[str, Any]]:
 
 
 def _append_snapshot(history: list[dict[str, Any]], total: int) -> list[dict[str, Any]]:
-    """Append today's total, replacing today's entry if one already
-    exists so successive renders within the same UTC day don't bloat
-    the history."""
     today = datetime.now(UTC).strftime("%Y-%m-%d")
     out = [e for e in history if e.get("date") != today]
     out.append({"date": today, "total": int(total)})
@@ -80,36 +80,57 @@ def fetch(
 ) -> dict[str, Any]:
     del settings
     core = _core()
-    if not core.get_token():
-        return {"error": "Set a GitHub token in GitHub Core (GraphQL API requires auth)."}
+    if core is None:
+        return {"error": "Install and enable GitHub Core to use this widget."}
 
-    user = _resolve_user(options, core)
+    account_id = (options.get("account") or "").strip() or None
+    try:
+        account = core.resolve_account(account_id, require_auth=True, require_user_token=True)
+    except Exception as err:
+        return {"error": core.coerce_error(err)}
+    assert account is not None
+    account_name = str(account.get("name") or "")
+    acct_key = str(account.get("id") or "default")
+
+    user = _resolve_user(options, core, account_id)
     if not user:
-        return {"error": "Set a username here or a default in GitHub Core."}
+        return {
+            "error": (
+                f"No GitHub username resolved for '{account_name}'. Enter a username in widget "
+                "options or click Test on the account in GitHub Core (/plugins/github_core/)."
+            )
+        }
     if not USERNAME_RE.match(user):
         return {"error": f"'{user}' isn't a valid GitHub username."}
 
     data_dir = Path(ctx["data_dir"])
     data_dir.mkdir(parents=True, exist_ok=True)
-    cache = data_dir / f"star_count_{user}.json"
-    history_path = data_dir / f"star_history_{user}.json"
+    safe_key = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{acct_key}_{user}")
+    cache = data_dir / f"star_count_{safe_key}.json"
+    history_path = data_dir / f"star_history_{safe_key}.json"
 
-    if cache.exists() and time.time() - cache.stat().st_mtime < CACHE_TTL_S:
+    if not ctx.get("fresh") and cache.exists() and time.time() - cache.stat().st_mtime < CACHE_TTL_S:
         try:
             return json.loads(cache.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             pass
 
     try:
-        payload = core.request_graphql(_QUERY, {"login": user})
+        payload = core.request_graphql(_QUERY, {"login": user}, account_id=account_id)
     except Exception as err:
-        return {"error": core.coerce_error(err)}
+        return {"error": core.coerce_error(err, account_name=account_name, user=user)}
 
-    if isinstance(payload, dict) and payload.get("errors"):
-        msg = payload["errors"][0].get("message") if payload["errors"] else "GraphQL error"
-        return {"error": f"GitHub GraphQL: {msg}"}
+    gql_err = core.coerce_graphql_error(
+        payload, account_name=account_name, auth_type=str(account.get("auth_type") or "")
+    )
+    if gql_err:
+        return {"error": gql_err}
 
-    repos_block = (payload or {}).get("data", {}).get("user", {}).get("repositories") or {}
+    user_node = (payload or {}).get("data", {}).get("user")
+    if not user_node:
+        return {"error": f"GitHub user '@{user}' was not found."}
+
+    repos_block = user_node.get("repositories") or {}
     nodes = repos_block.get("nodes") or []
     total_repos = int(repos_block.get("totalCount") or 0)
     total_stars = sum(int(n.get("stargazerCount") or 0) for n in nodes)

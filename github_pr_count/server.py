@@ -1,11 +1,4 @@
-"""github_pr_count, total-open-PRs hero number.
-
-Hits the same /search/issues endpoint github_pr_queue uses but only
-keeps the counts and the oldest PR age per bucket. Two searches: PRs
-you authored that are still open, and PRs that have explicitly
-requested your review. The combined count is the headline; the
-oldest age drives the "stale" indicator.
-"""
+"""github_pr_count, total-open-PRs hero number."""
 
 from __future__ import annotations
 
@@ -24,7 +17,18 @@ USERNAME_RE = re.compile(r"^[A-Za-z0-9-]{1,39}$")
 
 
 def _core() -> Any:
-    return current_app.config["PLUGIN_REGISTRY"].get("github_core").server_module
+    plugin = current_app.config["PLUGIN_REGISTRY"].get("github_core")
+    return plugin.server_module if plugin is not None else None
+
+
+def choices(name: str, options: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    del options
+    if name != "account":
+        return []
+    core = _core()
+    if core is None:
+        return [{"value": "", "label": "Install GitHub Core to configure accounts.", "note": True}]
+    return list(core.account_choices(require_auth=True))
 
 
 def _days_open(iso: str | None) -> int:
@@ -37,13 +41,12 @@ def _days_open(iso: str | None) -> int:
     return max(0, int((datetime.now(UTC) - ts).total_seconds() // 86400))
 
 
-def _bucket(core: Any, query: str) -> dict[str, Any]:
-    """Search one query, return total_count + oldest open age."""
+def _bucket(core: Any, query: str, *, account_id: str | None) -> dict[str, Any]:
     url = (
         "https://api.github.com/search/issues?"
         + urllib.parse.urlencode({"q": query, "sort": "created", "order": "asc", "per_page": 1})
     )
-    payload = core.request_json(url)
+    payload = core.request_json(url, account_id=account_id)
     items = payload.get("items") or []
     oldest = _days_open(items[0].get("created_at")) if items else 0
     return {
@@ -57,12 +60,26 @@ def fetch(
 ) -> dict[str, Any]:
     del settings
     core = _core()
-    if not core.get_token():
-        return {"error": "Set a GitHub token in GitHub Core (search API requires auth)."}
+    if core is None:
+        return {"error": "Install and enable GitHub Core to use this widget."}
 
-    user = (options.get("user") or "").strip() or core.get_username()
+    account_id = (options.get("account") or "").strip() or None
+    try:
+        account = core.resolve_account(account_id, require_auth=True, require_user_token=True)
+    except Exception as err:
+        return {"error": core.coerce_error(err)}
+    assert account is not None
+    account_name = str(account.get("name") or "")
+    acct_key = str(account.get("id") or "default")
+
+    user = (options.get("user") or "").strip().lstrip("@") or core.get_username(account_id)
     if not user:
-        return {"error": "Set a username here or a default in GitHub Core."}
+        return {
+            "error": (
+                f"No GitHub username resolved for '{account_name}'. Enter a username in widget "
+                "options or click Test on the account in GitHub Core (/plugins/github_core/)."
+            )
+        }
     if not USERNAME_RE.match(user):
         return {"error": f"'{user}' isn't a valid GitHub username."}
 
@@ -70,8 +87,9 @@ def fetch(
 
     data_dir = Path(ctx["data_dir"])
     data_dir.mkdir(parents=True, exist_ok=True)
-    cache = data_dir / f"pr_count_{user}.json"
-    if cache.exists() and time.time() - cache.stat().st_mtime < CACHE_TTL_S:
+    safe_key = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{acct_key}_{user}")
+    cache = data_dir / f"pr_count_{safe_key}.json"
+    if not ctx.get("fresh") and cache.exists() and time.time() - cache.stat().st_mtime < CACHE_TTL_S:
         try:
             cached = json.loads(cache.read_text(encoding="utf-8"))
             cached["stale_days"] = stale_days
@@ -80,10 +98,10 @@ def fetch(
             pass
 
     try:
-        yours = _bucket(core, f"is:pr is:open author:{user}")
-        review = _bucket(core, f"is:pr is:open review-requested:{user}")
+        yours = _bucket(core, f"is:pr is:open author:{user}", account_id=account_id)
+        review = _bucket(core, f"is:pr is:open review-requested:{user}", account_id=account_id)
     except Exception as err:
-        return {"error": core.coerce_error(err)}
+        return {"error": core.coerce_error(err, account_name=account_name, user=user)}
 
     result = {
         "user": user,
